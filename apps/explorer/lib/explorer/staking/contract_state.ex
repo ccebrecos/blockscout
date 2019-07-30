@@ -9,8 +9,11 @@ defmodule Explorer.Staking.ContractState do
 
   alias Explorer.Chain
   alias Explorer.Chain.Events.{Publisher, Subscriber}
+  alias Explorer.Chain.{Hash, Token}
   alias Explorer.SmartContract.Reader
   alias Explorer.Staking.ContractReader
+  alias Explorer.Token.BalanceReader
+  alias Indexer.Fetcher.TokenBalance
 
   @table_name __MODULE__
   @table_keys [
@@ -79,7 +82,7 @@ defmodule Explorer.Staking.ContractState do
   end
 
   def handle_continue(_, state) do
-    fetch_state(state.contracts, state.abi)
+    fetch_state(state.contracts, state.abi, state.seen_block)
     {:noreply, state}
   end
 
@@ -88,15 +91,17 @@ defmodule Explorer.Staking.ContractState do
     latest_block = Enum.max_by(blocks, & &1.number)
 
     if latest_block.number > state.seen_block do
-      fetch_state(state.contracts, state.abi)
+      fetch_state(state.contracts, state.abi, latest_block.number)
       {:noreply, %{state | seen_block: latest_block.number}}
     else
       {:noreply, state}
     end
   end
 
-  defp fetch_state(contracts, abi) do
+  defp fetch_state(contracts, abi, block_number) do
     global_responses = ContractReader.perform_requests(ContractReader.global_requests(), contracts, abi)
+
+    token = get_token(global_responses.token_contract_address)
 
     settings =
       global_responses
@@ -108,7 +113,7 @@ defmodule Explorer.Staking.ContractState do
         :epoch_end_block
       ])
       |> Map.to_list()
-      |> Enum.concat(token: get_token(global_responses.token_contract_address))
+      |> Enum.concat(token: token)
 
     :ets.insert(@table_name, settings)
 
@@ -118,6 +123,26 @@ defmodule Explorer.Staking.ContractState do
       pools
       |> Enum.map(&ContractReader.pool_staking_requests/1)
       |> ContractReader.perform_grouped_requests(pools, contracts, abi)
+
+    pool_balances =
+      pools
+      |> Enum.map(
+        &%{
+          token_contract_address_hash: global_responses.token_contract_address,
+          address_hash: &1,
+          block_number: nil
+        }
+      )
+      |> BalanceReader.get_balances_of()
+      |> Enum.zip(pools)
+      |> Enum.map(fn {{:ok, balance}, pool} ->
+        %{
+          token_contract_address_hash: global_responses.token_contract_address,
+          address_hash: pool,
+          block_number: block_number,
+          balance: balance
+        }
+      end)
 
     pool_mining_responses =
       pool_staking_responses
@@ -192,6 +217,18 @@ defmodule Explorer.Staking.ContractState do
         staking_pools: %{params: pool_entries},
         staking_pools_delegators: %{params: delegator_entries},
         timeout: :infinity
+      })
+
+    :ok = TokenBalance.import_token_balances(pool_balances)
+
+    {:ok, token_address_hash} = Hash.Address.cast(token.contract_address_hash)
+
+    # it may return {:error, ... "up to date"...}
+    _ =
+      Chain.update_token(%Token{
+        contract_address_hash: token_address_hash,
+        type: token.type,
+        total_supply: token.total_supply
       })
 
     Publisher.broadcast(:staking_update)
